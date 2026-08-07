@@ -50,10 +50,40 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
 # 2b. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
 # (acentos, títulos en otro idioma que Cinemeta nos da en inglés, etc).
 #
-# IMPORTANTE: el buscador de LaMovie no funciona con un GET simple (?s=...)
-# vía requests -- está armado con JS/AJAX (tema WordPress tipo Dooplay), así
-# que un GET plano no devuelve resultados aunque el sitio "sí" los tenga.
-# Por eso la búsqueda también se hace con Playwright (navegador real).
+# Intento 1 (rápido, sin navegador): la API REST nativa de WordPress
+# (/wp-json/wp/v2/...) suele estar habilitada por defecto y no depende de JS.
+# Probamos varios post-types típicos de sitios con tema Dooplay (movies,
+# tvshows, post genérico) hasta encontrar uno que devuelva resultados.
+def search_lamovie_restapi(title: str, expect_path: str):
+    post_types_to_try = ["movies", "tvshows", "posts"] if expect_path == "peliculas" else ["tvshows", "movies", "posts"]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    for post_type in post_types_to_try:
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/wp-json/wp/v2/{post_type}",
+                params={"search": title, "per_page": 5},
+                timeout=8,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                continue
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                continue
+            for item in data:
+                link = item.get("link", "")
+                if f"/{expect_path}/" in link:
+                    print(f"Resultado por REST API ({post_type}): {link}")
+                    return link
+        except Exception as e:
+            print(f"REST API search falló para post_type={post_type}: {e}")
+            continue
+    return None
+
+
+# Intento 2 (respaldo, con navegador): el buscador visual del sitio, que
+# puede estar armado con JS/AJAX (tema Dooplay), así que necesita Playwright
+# para ejecutarse de verdad en vez de un GET plano.
 async def search_lamovie_playwright(title: str, expect_path: str):
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -147,6 +177,13 @@ async def extract_m3u8_playwright(url: str):
 
             titulo = await page.title()
             print(f"Título de la página: {titulo}")
+
+            # Si la URL no existe (404), no tiene sentido perder ~15s haciendo
+            # clic y esperando: cortamos acá para pasar más rápido al respaldo
+            # de búsqueda.
+            if "no encontrada" in titulo.lower() or "404" in titulo:
+                print("Página no encontrada, saltando intento de reproducción.")
+                return None, None
 
             # Intento de clic robusto: probamos varios selectores típicos de
             # reproductores (no solo "#player .--pl", que puede no existir
@@ -262,21 +299,18 @@ async def get_stream(type: str, id: str):
 
     m3u8_url, req_headers = await extract_m3u8_playwright(target_url)
 
-    # Si la URL "adivinada" (título-año) no encontró nada, probamos el
-    # buscador propio del sitio como respaldo antes de rendirnos.
+    # Si la URL "adivinada" (título-año) no encontró nada, probamos primero la
+    # API REST (rápida) y si no, el buscador visual con navegador (respaldo).
     if not m3u8_url:
         if type == "series" and season and episode:
-            # El buscador nos da la página de la SERIE (/series/slug/), no la
-            # del episodio directo. Sacamos el slug real de ahí y con eso
-            # armamos la URL del episodio.
-            series_url = await search_lamovie_playwright(title, "series")
+            series_url = search_lamovie_restapi(title, "series") or await search_lamovie_playwright(title, "series")
             if series_url:
                 real_slug = series_url.rstrip("/").split("/")[-1]
                 found_url = f"{BASE_URL}/episodio/{real_slug}-temporada-{season}-episodio-{episode}/"
                 print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
                 m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
         else:
-            found_url = await search_lamovie_playwright(title, "peliculas")
+            found_url = search_lamovie_restapi(title, "peliculas") or await search_lamovie_playwright(title, "peliculas")
             if found_url:
                 print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
                 m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
