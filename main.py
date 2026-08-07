@@ -48,22 +48,40 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
 
 
 # 2b. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
-# (acentos, títulos re-formulados, etc). Usa el buscador propio del sitio como
-# respaldo antes de rendirnos.
-def search_lamovie(title: str, expect_path: str):
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/",
-            params={"s": title},
-            timeout=8,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+# (acentos, títulos en otro idioma que Cinemeta nos da en inglés, etc).
+#
+# IMPORTANTE: el buscador de LaMovie no funciona con un GET simple (?s=...)
+# vía requests -- está armado con JS/AJAX (tema WordPress tipo Dooplay), así
+# que un GET plano no devuelve resultados aunque el sitio "sí" los tenga.
+# Por eso la búsqueda también se hace con Playwright (navegador real).
+async def search_lamovie_playwright(title: str, expect_path: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
         )
-        # Buscamos links que apunten al tipo esperado (peliculas/ o series/)
-        matches = re.findall(r'href="(https://lamovie\.org/' + re.escape(expect_path) + r'/[^"]+)"', resp.text)
-        return matches[0] if matches else None
-    except Exception as e:
-        print(f"Error buscando en LaMovie: {e}")
-        return None
+        try:
+            context = await browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = await context.new_page()
+            search_url = f"{BASE_URL}/?s={title}"
+            print(f"Buscando en el sitio: {search_url}")
+            await page.goto(search_url, wait_until="networkidle", timeout=15000)
+
+            # Juntamos todos los <a href> de la página ya renderizada (JS incluido)
+            # y nos quedamos con el primero que apunte al tipo esperado.
+            hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+            for href in hrefs:
+                if f"/{expect_path}/" in href and href.rstrip("/") != f"{BASE_URL}/{expect_path}".rstrip("/"):
+                    print(f"Resultado de búsqueda encontrado: {href}")
+                    return href
+            return None
+        except Exception as e:
+            print(f"Error buscando en LaMovie: {e}")
+            return None
+        finally:
+            await browser.close()
 
 
 # 3. EXTRACTOR CON PLAYWRIGHT (VERSIÓN INTEGRAL: SEGUNDO CLIC Y BLOQUEO SUAVE)
@@ -247,11 +265,21 @@ async def get_stream(type: str, id: str):
     # Si la URL "adivinada" (título-año) no encontró nada, probamos el
     # buscador propio del sitio como respaldo antes de rendirnos.
     if not m3u8_url:
-        expect_path = "episodio" if (type == "series" and season and episode) else "peliculas"
-        found_url = search_lamovie(title, expect_path)
-        if found_url:
-            print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
-            m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
+        if type == "series" and season and episode:
+            # El buscador nos da la página de la SERIE (/series/slug/), no la
+            # del episodio directo. Sacamos el slug real de ahí y con eso
+            # armamos la URL del episodio.
+            series_url = await search_lamovie_playwright(title, "series")
+            if series_url:
+                real_slug = series_url.rstrip("/").split("/")[-1]
+                found_url = f"{BASE_URL}/episodio/{real_slug}-temporada-{season}-episodio-{episode}/"
+                print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
+                m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
+        else:
+            found_url = await search_lamovie_playwright(title, "peliculas")
+            if found_url:
+                print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
+                m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
 
     if m3u8_url:
         stream_title = "LaMovie 🎬"
