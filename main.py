@@ -1,0 +1,293 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from playwright.async_api import async_playwright
+import uvicorn
+import requests
+import re
+import asyncio
+import os
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BASE_URL = "https://lamovie.org"
+
+
+# 1. FUNCIÓN PARA TRANSFORMAR EL TÍTULO EN UN SLUG (Ej: "The Matrix" -> "the-matrix")
+def slugify(text: str) -> str:
+    text = text.lower()
+    text = re.sub(r'[^a-z0-9\s-]', '', text)
+    text = re.sub(r'[\s-]+', '-', text).strip('-')
+    return text
+
+
+# 2. FUNCIÓN PARA OBTENER EL NOMBRE Y AÑO DESDE CINEMETA (API OFICIAL DE STREMIO)
+def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
+    try:
+        url = f"https://v3-cinemeta.strem.io/meta/{media_type}/{imdb_id}.json"
+        response = requests.get(url, timeout=5).json()
+        meta = response.get("meta", {})
+
+        title = meta.get("name")
+        year = meta.get("year", "")
+
+        if year and "-" in str(year):
+            year = str(year).split("-")[0]
+
+        return title, year
+    except Exception as e:
+        print(f"Error consultando Cinemeta: {e}")
+        return None, None
+
+
+# 2b. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
+# (acentos, títulos re-formulados, etc). Usa el buscador propio del sitio como
+# respaldo antes de rendirnos.
+def search_lamovie(title: str, expect_path: str):
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/",
+            params={"s": title},
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"},
+        )
+        # Buscamos links que apunten al tipo esperado (peliculas/ o series/)
+        matches = re.findall(r'href="(https://lamovie\.org/' + re.escape(expect_path) + r'/[^"]+)"', resp.text)
+        return matches[0] if matches else None
+    except Exception as e:
+        print(f"Error buscando en LaMovie: {e}")
+        return None
+
+
+# 3. EXTRACTOR CON PLAYWRIGHT (VERSIÓN INTEGRAL: SEGUNDO CLIC Y BLOQUEO SUAVE)
+async def extract_m3u8_playwright(url: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+
+        result = {"url": None, "headers": None}
+
+        # Bloqueador SUAVE: Solo bloqueamos anuncios puros, dejamos pasar estilos y scripts del reproductor
+        async def intercept_route(route):
+            request_url = route.request.url.lower()
+            ad_keywords = ["/ads/", "vast", "vpaid", "pop", "tracker", "analytics", "doubleclick", "adservice"]
+
+            if any(ad in request_url for ad in ad_keywords):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", intercept_route)
+
+        # Cierre de ventanas emergentes (Popups)
+        async def close_popups(new_page):
+            try:
+                await new_page.close()
+            except Exception:
+                pass
+
+        context.on("page", close_popups)
+
+        # El detective de red (Busca cualquier rastro del video), guardando
+        # también los headers reales con los que se pidió, para poder
+        # reproducirlo después (Referer/Origin/User-Agent).
+        async def handle_request(request):
+            if result["url"]:
+                return
+            url_lower = request.url.lower()
+            if ".m3u8" in url_lower or ".mp4" in url_lower or "master.json" in url_lower:
+                print(f"👉 ¡VIDEO DETECTADO!: {request.url}")
+                headers = request.headers
+                result["url"] = request.url
+                result["headers"] = {
+                    "Referer": headers.get("referer", url),
+                    "Origin": headers.get("origin", "/".join(url.split("/")[:3])),
+                    "User-Agent": headers.get(
+                        "user-agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    ),
+                }
+
+        page.on("request", handle_request)
+
+        try:
+            print(f"Navegando a: {url}")
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+            titulo = await page.title()
+            print(f"Título de la página: {titulo}")
+
+            # Intento de clic robusto: probamos varios selectores típicos de
+            # reproductores (no solo "#player .--pl", que puede no existir
+            # según el player embebido), y si ninguno existe, hacemos clic en
+            # el centro del iframe/página como último recurso.
+            click_selectors = [
+                "#player .--pl",
+                ".jw-icon-playback",
+                ".vjs-big-play-button",
+                ".plyr__control--overlaid",
+                "#player",
+                "video",
+            ]
+            clicked = False
+            for sel in click_selectors:
+                if result["url"]:
+                    break
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.click(timeout=3000)
+                        clicked = True
+                        print(f"Clic ejecutado sobre selector: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not clicked and not result["url"]:
+                try:
+                    box = await page.viewport_size()
+                    if box:
+                        await page.mouse.click(box["width"] // 2, box["height"] // 2)
+                        print("Clic de respaldo en el centro de la página ejecutado.")
+                except Exception:
+                    pass
+
+            for _ in range(15):  # ~15 segundos de paciencia para el anuncio / carga
+                if result["url"]:
+                    break
+
+                try:
+                    skip_btn = page.get_by_text(re.compile(r"saltar|skip|close|cerrar", re.IGNORECASE)).first
+                    if await skip_btn.is_visible():
+                        await skip_btn.click()
+                        print("Botón Saltar presionado. Dando un segundo para procesar...")
+                        await asyncio.sleep(1)
+
+                        # Reintento de clic tras saltar el anuncio, por si el
+                        # player quedó en pausa.
+                        for sel in click_selectors:
+                            try:
+                                el = page.locator(sel).first
+                                if await el.count() > 0:
+                                    await el.click(timeout=2000)
+                                    print(f"Segundo clic ejecutado sobre selector: {sel}")
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"Error en Playwright: {e}")
+        finally:
+            await browser.close()
+
+        return result["url"], result["headers"]
+
+
+# 4. ENDPOINT DEL MANIFEST (CONFIGURADO PARA PELÍCULAS Y SERIES)
+@app.get("/manifest.json")
+def get_manifest():
+    return {
+        "id": "com.lamovie.extractor.custom",
+        "version": "1.2.0",
+        "name": "LaMovie Extractor Addon",
+        "description": "Extrae streams de películas y series de LaMovie usando Playwright.",
+        "types": ["movie", "series"],
+        "catalogs": [],
+        "resources": ["stream"],
+        "idPrefixes": ["tt"],
+    }
+
+
+# 5. ENDPOINT DE STREAMING (CONSTRUCCIÓN DE URL)
+@app.get("/stream/{type}/{id}.json")
+async def get_stream(type: str, id: str):
+    imdb_id = id
+    season = None
+    episode = None
+
+    if ":" in id:
+        imdb_id, season, episode = id.split(":")
+
+    title, year = get_metadata_from_cinemeta(type, imdb_id)
+
+    if not title:
+        return {"streams": []}
+
+    slug_title = slugify(title)
+
+    # Construimos la URL según el patrón real del sitio:
+    # - Películas: /peliculas/{slug}-{año}/
+    # - Episodios de serie: /episodio/{slug}-temporada-{n}-episodio-{n}/
+    if type == "series" and season and episode:
+        target_url = f"{BASE_URL}/episodio/{slug_title}-temporada-{season}-episodio-{episode}/"
+    else:
+        target_url = f"{BASE_URL}/peliculas/{slug_title}-{year}/" if year else f"{BASE_URL}/peliculas/{slug_title}/"
+
+    print(f"Extrayendo de: {target_url}")
+
+    m3u8_url, req_headers = await extract_m3u8_playwright(target_url)
+
+    # Si la URL "adivinada" (título-año) no encontró nada, probamos el
+    # buscador propio del sitio como respaldo antes de rendirnos.
+    if not m3u8_url:
+        expect_path = "episodio" if (type == "series" and season and episode) else "peliculas"
+        found_url = search_lamovie(title, expect_path)
+        if found_url:
+            print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
+            m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
+
+    if m3u8_url:
+        stream_title = "LaMovie 🎬"
+        if season and episode:
+            stream_title += f" (T{season} - E{episode})"
+
+        stream_obj = {
+            "name": "LaMovie",
+            "title": stream_title,
+            "url": m3u8_url,
+        }
+        # Si logramos capturar los headers reales con los que se pidió el
+        # video, se los pasamos a Stremio para que los reenvíe al reproducir
+        # (si no, muchos CDNs rechazan la petición por Referer/Origin).
+        if req_headers:
+            stream_obj["behaviorHints"] = {
+                "notWebReady": True,
+                "proxyHeaders": {"request": req_headers},
+            }
+
+        return {"streams": [stream_obj]}
+
+    return {"streams": []}
+
+
+# 6. RUTA RAÍZ PARA EVITAR EL ERROR "NOT FOUND"
+@app.get("/")
+def home():
+    return {
+        "status": "online",
+        "addon": "LaMovie Extractor",
+        "instruction": "Copia la ruta /manifest.json e instálala en Stremio.",
+    }
+
+
+if __name__ == "__main__":
+    # Toma el puerto que asigne Railway, o usa 8080 por defecto
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("main:app", host="0.0.0.0", port=port)
