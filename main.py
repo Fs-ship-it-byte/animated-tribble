@@ -20,10 +20,30 @@ app.add_middleware(
 
 BASE_URL = "https://lamovie.org"
 
+# Algunos títulos (sobre todo estrenos muy recientes) usan una traducción
+# "inventada" por el propio sitio que no coincide ni con el título en inglés
+# ni con el título oficial en español de Wikidata/Wikipedia -- para esos casos
+# puntuales no hay forma de adivinar automáticamente, así que se cargan acá
+# a mano una vez que se descubren. Formato: "ttXXXXXXX": "slug-del-sitio-año"
+MANUAL_SLUG_OVERRIDES = {
+    "tt12042730": "proyecto-fin-del-mundo-2026",       # Project Hail Mary
+    "tt33612209": "el-diablo-viste-a-la-moda-2-2026",  # The Devil Wears Prada 2
+}
+
 
 # 1. FUNCIÓN PARA TRANSFORMAR EL TÍTULO EN UN SLUG (Ej: "The Matrix" -> "the-matrix")
 def slugify(text: str) -> str:
     text = text.lower()
+    # Transliterar acentos/ñ a su equivalente ASCII ANTES de eliminar caracteres
+    # no permitidos -- si no, "último" quedaba "ltimo" en vez de "ultimo"
+    # (se perdía la vocal en vez de convertirse), armando una URL inexistente.
+    accents = {
+        'á': 'a', 'é': 'e', 'í': 'i', 'ó': 'o', 'ú': 'u', 'ü': 'u',
+        'à': 'a', 'è': 'e', 'ì': 'i', 'ò': 'o', 'ù': 'u',
+        'ñ': 'n', 'ç': 'c',
+    }
+    for accented, plain in accents.items():
+        text = text.replace(accented, plain)
     text = re.sub(r'[^a-z0-9\s-]', '', text)
     text = re.sub(r'[\s-]+', '-', text).strip('-')
     return text
@@ -442,10 +462,19 @@ async def get_stream(type: str, id: str):
 
     slug_title = slugify(title)
 
+    # Si este IMDb ID tiene una anulación manual cargada (título traducido de
+    # forma distinta por el propio sitio), la usamos directo sin adivinar.
+    if imdb_id in MANUAL_SLUG_OVERRIDES:
+        override_slug = MANUAL_SLUG_OVERRIDES[imdb_id]
+        if type == "series" and season and episode:
+            target_url = f"{BASE_URL}/episodio/{override_slug}-temporada-{season}-episodio-{episode}/"
+        else:
+            target_url = f"{BASE_URL}/peliculas/{override_slug}/"
+        print(f"Usando anulación manual para {imdb_id}: {target_url}")
     # Construimos la URL según el patrón real del sitio:
     # - Películas: /peliculas/{slug}-{año}/
     # - Episodios de serie: /episodio/{slug}-temporada-{n}-episodio-{n}/
-    if type == "series" and season and episode:
+    elif type == "series" and season and episode:
         target_url = f"{BASE_URL}/episodio/{slug_title}-temporada-{season}-episodio-{episode}/"
     else:
         target_url = f"{BASE_URL}/peliculas/{slug_title}-{year}/" if year else f"{BASE_URL}/peliculas/{slug_title}/"
