@@ -48,7 +48,64 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
         return None, None
 
 
-# 2b. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
+# 2c. TRADUCCIÓN DEL TÍTULO vía Wikipedia (gratis, sin API key): muchos sitios
+# como LaMovie solo tienen el título en español, mientras que Cinemeta nos da
+# el título en inglés. Usamos los "langlinks" de Wikipedia (que conectan el
+# mismo artículo entre idiomas) para conseguir el título real en español antes
+# de intentar adivinar el slug o buscar en el sitio.
+def get_spanish_title_via_wikipedia(title: str, year: str = ""):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        # 1) Encontrar el título EXACTO del artículo en inglés (opensearch es
+        # tolerante a variaciones menores de texto).
+        search_resp = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "opensearch", "search": title, "limit": 3, "format": "json"},
+            timeout=6,
+            headers=headers,
+        )
+        candidates = search_resp.json()[1] if search_resp.status_code == 200 else []
+        if not candidates:
+            return None
+
+        # Preferimos el candidato que incluya el año (mejor desambiguación) si
+        # hay más de una opción.
+        en_title = candidates[0]
+        if year:
+            for c in candidates:
+                if str(year) in c:
+                    en_title = c
+                    break
+
+        # 2) Pedirle a Wikipedia el link equivalente en español para ese
+        # mismo artículo.
+        lang_resp = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "titles": en_title, "prop": "langlinks", "lllang": "es", "format": "json"},
+            timeout=6,
+            headers=headers,
+        )
+        if lang_resp.status_code != 200:
+            return None
+        pages = lang_resp.json().get("query", {}).get("pages", {})
+        for page in pages.values():
+            langlinks = page.get("langlinks")
+            if langlinks:
+                es_title = langlinks[0].get("*")
+                if es_title:
+                    # Wikipedia agrega desambiguaciones tipo "(película)",
+                    # "(película de 2005)", "(serie de televisión)" que no
+                    # forman parte del título real -- las sacamos.
+                    es_title = re.sub(r'\s*\((?:película|serie de televisión|serie)[^)]*\)\s*$', '', es_title, flags=re.IGNORECASE)
+                    print(f"Wikipedia: '{title}' -> '{es_title}' (en español)")
+                    return es_title.strip()
+        return None
+    except Exception as e:
+        print(f"Error consultando Wikipedia para traducción: {e}")
+        return None
+
+
+# 2d. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
 # (acentos, títulos en otro idioma que Cinemeta nos da en inglés, etc).
 #
 # Intento 1 (rápido, sin navegador): la API REST nativa de WordPress
@@ -311,8 +368,26 @@ async def get_stream(type: str, id: str):
 
     m3u8_url, req_headers = await extract_m3u8_playwright(target_url)
 
-    # Si la URL "adivinada" (título-año) no encontró nada, probamos primero la
-    # API REST (rápida) y si no, el buscador visual con navegador (respaldo).
+    # Si el slug en inglés no existe en el sitio (muy probable, ya que LaMovie
+    # es 100% en español), probamos con el título real en español antes de
+    # gastar tiempo en la búsqueda con navegador.
+    if not m3u8_url:
+        es_title = get_spanish_title_via_wikipedia(title, year)
+        if es_title:
+            es_slug = slugify(es_title)
+            if type == "series" and season and episode:
+                es_url = f"{BASE_URL}/episodio/{es_slug}-temporada-{season}-episodio-{episode}/"
+            else:
+                es_url = f"{BASE_URL}/peliculas/{es_slug}-{year}/" if year else f"{BASE_URL}/peliculas/{es_slug}/"
+            print(f"Reintentando con título en español: {es_url}")
+            m3u8_url, req_headers = await extract_m3u8_playwright(es_url)
+            # Guardamos el título en español para usarlo también en la
+            # búsqueda de respaldo si esto tampoco funcionó.
+            if not m3u8_url:
+                title = es_title
+
+    # Si nada de lo anterior encontró nada, probamos primero la API REST
+    # (rápida) y si no, el buscador visual con navegador (último respaldo).
     if not m3u8_url:
         if type == "series" and season and episode:
             series_url = search_lamovie_restapi(title, "series") or await search_lamovie_playwright(title, "series")
