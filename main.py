@@ -26,8 +26,10 @@ BASE_URL = "https://lamovie.org"
 # puntuales no hay forma de adivinar automáticamente, así que se cargan acá
 # a mano una vez que se descubren. Formato: "ttXXXXXXX": "slug-del-sitio-año"
 MANUAL_SLUG_OVERRIDES = {
-    "tt12042730": "proyecto-fin-del-mundo-2026",       # Project Hail Mary
-    "tt33612209": "el-diablo-viste-a-la-moda-2-2026",  # The Devil Wears Prada 2
+    "tt12042730": "proyecto-fin-del-mundo-2026",              # Project Hail Mary
+    "tt33612209": "el-diablo-viste-a-la-moda-2-2026",         # The Devil Wears Prada 2
+    "tt18259538": "avatar-aang-el-ultimo-maestro-aire-2026",  # Avatar: Aang, El Último Maestro del Aire
+    "tt2488496": "star-wars-el-despertar-de-la-fuerza-2015",  # Star Wars: Episodio VII
 }
 
 
