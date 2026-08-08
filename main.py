@@ -48,11 +48,68 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
         return None, None
 
 
-# 2c. TRADUCCIÓN DEL TÍTULO vía Wikipedia (gratis, sin API key): muchos sitios
-# como LaMovie solo tienen el título en español, mientras que Cinemeta nos da
-# el título en inglés. Usamos los "langlinks" de Wikipedia (que conectan el
-# mismo artículo entre idiomas) para conseguir el título real en español antes
-# de intentar adivinar el slug o buscar en el sitio.
+# 2c. TRADUCCIÓN DEL TÍTULO vía Wikidata (gratis, sin API key, y MUCHO más
+# confiable que buscar por texto en Wikipedia): Wikidata permite buscar el
+# artículo exacto por el ID DE IMDb (que ya tenemos), sin ambigüedad de
+# títulos ni desambiguaciones. Una vez encontrado el ítem, pedimos su
+# etiqueta ("label") en español.
+def get_spanish_title_via_wikidata(imdb_id: str):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    print(f"Consultando Wikidata para traducir vía IMDb ID: {imdb_id}")
+    try:
+        # 1) Buscar el ítem de Wikidata que tenga justo ese IMDb ID (P345).
+        search_resp = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "query",
+                "list": "search",
+                "srsearch": f"haswbstatement:P345={imdb_id}",
+                "format": "json",
+                "srlimit": 1,
+            },
+            timeout=6,
+            headers=headers,
+        )
+        if search_resp.status_code != 200:
+            print(f"Wikidata: búsqueda por IMDb ID falló, status={search_resp.status_code}")
+            return None
+        results = search_resp.json().get("query", {}).get("search", [])
+        if not results:
+            print(f"Wikidata: no hay ningún ítem con IMDb ID {imdb_id}")
+            return None
+        qid = results[0]["title"]  # ej: "Q123456"
+
+        # 2) Pedir la etiqueta en español de ese ítem.
+        label_resp = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={
+                "action": "wbgetentities",
+                "ids": qid,
+                "props": "labels",
+                "languages": "es",
+                "format": "json",
+            },
+            timeout=6,
+            headers=headers,
+        )
+        if label_resp.status_code != 200:
+            print(f"Wikidata: fallo al pedir la etiqueta de {qid}, status={label_resp.status_code}")
+            return None
+        entity = label_resp.json().get("entities", {}).get(qid, {})
+        es_label = entity.get("labels", {}).get("es", {}).get("value")
+        if es_label:
+            print(f"Wikidata: {imdb_id} ({qid}) -> '{es_label}' (en español)")
+            return es_label
+        print(f"Wikidata: {qid} no tiene etiqueta en español.")
+        return None
+    except Exception as e:
+        print(f"Error consultando Wikidata: {e}")
+        return None
+
+
+# 2d. TRADUCCIÓN DEL TÍTULO vía Wikipedia (respaldo si Wikidata no tiene el
+# IMDb ID cargado): busca por texto y sigue el link entre idiomas. Menos
+# confiable que Wikidata porque puede matchear la página equivocada.
 def get_spanish_title_via_wikipedia(title: str, year: str = ""):
     print(f"Consultando Wikipedia para traducir: '{title}' (año {year})")
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
@@ -87,22 +144,47 @@ def get_spanish_title_via_wikipedia(title: str, year: str = ""):
             timeout=6,
             headers=headers,
         )
-        if lang_resp.status_code != 200:
-            print(f"Wikipedia: fallo al pedir langlinks para '{en_title}' (status={lang_resp.status_code})")
+        # 2) Conseguir el ID de Wikidata del artículo (Wikipedia moderna ya no
+        # guarda los links entre idiomas en el "langlinks" clásico -- eso está
+        # desactualizado desde hace años. El link real entre idiomas vive en
+        # Wikidata, así que primero sacamos el Q-id del artículo en inglés.
+        props_resp = requests.get(
+            "https://en.wikipedia.org/w/api.php",
+            params={"action": "query", "titles": en_title, "prop": "pageprops", "format": "json"},
+            timeout=6,
+            headers=headers,
+        )
+        if props_resp.status_code != 200:
+            print(f"Wikipedia: fallo al pedir pageprops para '{en_title}' (status={props_resp.status_code})")
             return None
-        pages = lang_resp.json().get("query", {}).get("pages", {})
+        pages = props_resp.json().get("query", {}).get("pages", {})
+        wikidata_id = None
         for page in pages.values():
-            langlinks = page.get("langlinks")
-            if langlinks:
-                es_title = langlinks[0].get("*")
-                if es_title:
-                    # Wikipedia agrega desambiguaciones tipo "(película)",
-                    # "(película de 2005)", "(serie de televisión)" que no
-                    # forman parte del título real -- las sacamos.
-                    es_title = re.sub(r'\s*\((?:película|serie de televisión|serie)[^)]*\)\s*$', '', es_title, flags=re.IGNORECASE)
-                    print(f"Wikipedia: '{title}' -> '{es_title}' (en español)")
-                    return es_title.strip()
-        print(f"Wikipedia: '{en_title}' no tiene versión en español (sin langlinks 'es').")
+            wikidata_id = page.get("pageprops", {}).get("wikibase_item")
+            if wikidata_id:
+                break
+        if not wikidata_id:
+            print(f"Wikipedia: '{en_title}' no tiene wikibase_item asociado.")
+            return None
+
+        # 3) Con el Q-id, le pedimos a Wikidata el sitelink en español.
+        wd_resp = requests.get(
+            "https://www.wikidata.org/w/api.php",
+            params={"action": "wbgetentities", "ids": wikidata_id, "props": "sitelinks", "format": "json"},
+            timeout=6,
+            headers=headers,
+        )
+        if wd_resp.status_code != 200:
+            print(f"Wikidata: fallo al pedir sitelinks para {wikidata_id} (status={wd_resp.status_code})")
+            return None
+        entity = wd_resp.json().get("entities", {}).get(wikidata_id, {})
+        es_sitelink = entity.get("sitelinks", {}).get("eswiki", {})
+        es_title = es_sitelink.get("title")
+        if es_title:
+            es_title = re.sub(r'\s*\((?:película|serie de televisión|serie)[^)]*\)\s*$', '', es_title, flags=re.IGNORECASE)
+            print(f"Wikidata: '{title}' -> '{es_title}' (en español)")
+            return es_title.strip()
+        print(f"Wikidata: {wikidata_id} no tiene sitelink en español (eswiki).")
         return None
     except Exception as e:
         print(f"Error consultando Wikipedia para traducción: {e}")
@@ -376,7 +458,7 @@ async def get_stream(type: str, id: str):
     # es 100% en español), probamos con el título real en español antes de
     # gastar tiempo en la búsqueda con navegador.
     if not m3u8_url:
-        es_title = get_spanish_title_via_wikipedia(title, year)
+        es_title = get_spanish_title_via_wikidata(imdb_id) or get_spanish_title_via_wikipedia(title, year)
         if es_title:
             es_slug = slugify(es_title)
             if type == "series" and season and episode:
