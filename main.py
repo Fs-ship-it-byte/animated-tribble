@@ -54,6 +54,7 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
 # mismo artículo entre idiomas) para conseguir el título real en español antes
 # de intentar adivinar el slug o buscar en el sitio.
 def get_spanish_title_via_wikipedia(title: str, year: str = ""):
+    print(f"Consultando Wikipedia para traducir: '{title}' (año {year})")
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     try:
         # 1) Encontrar el título EXACTO del artículo en inglés (opensearch es
@@ -66,6 +67,7 @@ def get_spanish_title_via_wikipedia(title: str, year: str = ""):
         )
         candidates = search_resp.json()[1] if search_resp.status_code == 200 else []
         if not candidates:
+            print(f"Wikipedia: no se encontró ningún artículo para '{title}' (status={search_resp.status_code})")
             return None
 
         # Preferimos el candidato que incluya el año (mejor desambiguación) si
@@ -86,6 +88,7 @@ def get_spanish_title_via_wikipedia(title: str, year: str = ""):
             headers=headers,
         )
         if lang_resp.status_code != 200:
+            print(f"Wikipedia: fallo al pedir langlinks para '{en_title}' (status={lang_resp.status_code})")
             return None
         pages = lang_resp.json().get("query", {}).get("pages", {})
         for page in pages.values():
@@ -99,6 +102,7 @@ def get_spanish_title_via_wikipedia(title: str, year: str = ""):
                     es_title = re.sub(r'\s*\((?:película|serie de televisión|serie)[^)]*\)\s*$', '', es_title, flags=re.IGNORECASE)
                     print(f"Wikipedia: '{title}' -> '{es_title}' (en español)")
                     return es_title.strip()
+        print(f"Wikipedia: '{en_title}' no tiene versión en español (sin langlinks 'es').")
         return None
     except Exception as e:
         print(f"Error consultando Wikipedia para traducción: {e}")
