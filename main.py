@@ -6,6 +6,7 @@ import requests
 import re
 import asyncio
 import os
+from urllib.parse import quote_plus
 
 app = FastAPI()
 
@@ -65,16 +66,19 @@ def search_lamovie_restapi(title: str, expect_path: str):
                 timeout=8,
                 headers=headers,
             )
+            print(f"REST API [{post_type}] status={resp.status_code}, body[:200]={resp.text[:200]!r}")
             if resp.status_code != 200:
                 continue
             data = resp.json()
             if not isinstance(data, list) or not data:
+                print(f"REST API [{post_type}]: respuesta no es una lista con resultados.")
                 continue
             for item in data:
                 link = item.get("link", "")
                 if f"/{expect_path}/" in link:
                     print(f"Resultado por REST API ({post_type}): {link}")
                     return link
+            print(f"REST API [{post_type}]: encontró {len(data)} items pero ninguno con /{expect_path}/ en el link.")
         except Exception as e:
             print(f"REST API search falló para post_type={post_type}: {e}")
             continue
@@ -95,13 +99,21 @@ async def search_lamovie_playwright(title: str, expect_path: str):
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             )
             page = await context.new_page()
-            search_url = f"{BASE_URL}/?s={title}"
+            search_url = f"{BASE_URL}/?s={quote_plus(title)}"
             print(f"Buscando en el sitio: {search_url}")
             await page.goto(search_url, wait_until="networkidle", timeout=15000)
+
+            final_url = page.url
+            page_title = await page.title()
+            print(f"Página de búsqueda cargada. URL final: {final_url} | título: {page_title}")
 
             # Juntamos todos los <a href> de la página ya renderizada (JS incluido)
             # y nos quedamos con el primero que apunte al tipo esperado.
             hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
+            print(f"Total de links <a> encontrados en la página de búsqueda: {len(hrefs)}")
+            candidatos = [h for h in hrefs if f"/{expect_path}/" in h]
+            print(f"De esos, {len(candidatos)} contienen '/{expect_path}/': {candidatos[:5]}")
+
             for href in hrefs:
                 if f"/{expect_path}/" in href and href.rstrip("/") != f"{BASE_URL}/{expect_path}".rstrip("/"):
                     print(f"Resultado de búsqueda encontrado: {href}")
