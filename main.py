@@ -649,7 +649,11 @@ async def get_stream(type: str, id: str):
             found_slug = api_match.get("slug", "")
             print(f"Match encontrado por API interna: {found_slug}")
             if type == "series" and season and episode:
-                target_url = f"{BASE_URL}/episodio/{found_slug}-temporada-{season}-episodio-{episode}/"
+                # El slug de la serie puede traer el año pegado (ej:
+                # "house-of-the-dragon-2022"), pero la URL de episodio NO lo
+                # lleva -- hay que sacarlo antes de agregar temporada/episodio.
+                series_slug = re.sub(r'-\d{4}$', '', found_slug)
+                target_url = f"{BASE_URL}/episodio/{series_slug}-temporada-{season}-episodio-{episode}/"
             else:
                 target_url = f"{BASE_URL}/peliculas/{found_slug}/"
         # Construimos la URL según el patrón real del sitio:
@@ -690,7 +694,8 @@ async def get_stream(type: str, id: str):
                     found_slug = api_match_es.get("slug", "")
                     print(f"Match encontrado por API interna (español): {found_slug}")
                     if type == "series" and season and episode:
-                        es_api_url = f"{BASE_URL}/episodio/{found_slug}-temporada-{season}-episodio-{episode}/"
+                        series_slug_es = re.sub(r'-\d{4}$', '', found_slug)
+                        es_api_url = f"{BASE_URL}/episodio/{series_slug_es}-temporada-{season}-episodio-{episode}/"
                     else:
                         es_api_url = f"{BASE_URL}/peliculas/{found_slug}/"
                     m3u8_url, req_headers = await extract_m3u8_playwright(es_api_url)
