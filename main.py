@@ -215,6 +215,64 @@ def get_spanish_title_via_wikipedia(title: str, year: str = ""):
         return None
 
 
+# 2c. BÚSQUEDA VÍA LA API INTERNA REAL DEL SITIO (descubierta inspeccionando
+# el Network tab del navegador): https://lamovie.org/wp-api/v1/search
+# Esto NO es la API REST estándar de WordPress (esa no devuelve nada útil acá)
+# sino un endpoint propio del tema, que da JSON limpio con slug, título
+# original en inglés, y tipo (movies/tvshows). Es rápido (sin navegador) y
+# mucho más confiable que adivinar traducciones, porque comparamos directo
+# contra "original_title" en inglés.
+def search_lamovie_api(query: str, per_page: int = 8):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/wp-api/v1/search",
+            params={"postType": "any", "q": query, "postsPerPage": per_page},
+            timeout=8,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            print(f"API de búsqueda interna: status={resp.status_code} para q='{query}'")
+            return []
+        posts = resp.json().get("data", {}).get("posts", [])
+        print(f"API de búsqueda interna para '{query}': {len(posts)} resultado(s)")
+        return posts
+    except Exception as e:
+        print(f"Error en API de búsqueda interna: {e}")
+        return []
+
+
+def _norm_compare(s: str) -> str:
+    return re.sub(r'[^a-z0-9]', '', (s or '').lower())
+
+
+# Elige, entre los resultados de la API, el que mejor matchee contra el
+# título en inglés (comparando "original_title") y, si lo tenemos, el año.
+def pick_best_api_match(posts, title: str, year: str, want_series: bool):
+    if not posts:
+        return None
+    target = _norm_compare(title)
+
+    def type_matches(p):
+        t = (p.get("type") or "").lower()
+        if want_series:
+            return t in ("tvshows", "series", "shows")
+        return t in ("movies", "movie", "")
+
+    same_type = [p for p in posts if type_matches(p)] or posts
+
+    # 1) Match exacto de original_title (+ año si lo tenemos)
+    for p in same_type:
+        if _norm_compare(p.get("original_title", "")) == target:
+            if not year or str(year) in str(p.get("release_date", "")):
+                return p
+    # 2) Match exacto de original_title, sin filtrar por año
+    for p in same_type:
+        if _norm_compare(p.get("original_title", "")) == target:
+            return p
+    return None
+
+
 # 2d. BÚSQUEDA EN EL SITIO: por si el slug "titulo-año" no coincide exacto
 # (acentos, títulos en otro idioma que Cinemeta nos da en inglés, etc).
 #
@@ -497,13 +555,26 @@ async def get_stream(type: str, id: str):
         else:
             target_url = f"{BASE_URL}/peliculas/{override_slug}/"
         print(f"Usando anulación manual para {imdb_id}: {target_url}")
-    # Construimos la URL según el patrón real del sitio:
-    # - Películas: /peliculas/{slug}-{año}/
-    # - Episodios de serie: /episodio/{slug}-temporada-{n}-episodio-{n}/
-    elif type == "series" and season and episode:
-        target_url = f"{BASE_URL}/episodio/{slug_title}-temporada-{season}-episodio-{episode}/"
     else:
-        target_url = f"{BASE_URL}/peliculas/{slug_title}-{year}/" if year else f"{BASE_URL}/peliculas/{slug_title}/"
+        # Antes de adivinar nada, probamos la API interna real del sitio,
+        # comparando por "original_title" (inglés) -- resuelve el problema de
+        # idioma de raíz sin depender de traducir nosotros.
+        api_posts = search_lamovie_api(title)
+        api_match = pick_best_api_match(api_posts, title, year, want_series=(type == "series"))
+        if api_match:
+            found_slug = api_match.get("slug", "")
+            print(f"Match encontrado por API interna: {found_slug}")
+            if type == "series" and season and episode:
+                target_url = f"{BASE_URL}/episodio/{found_slug}-temporada-{season}-episodio-{episode}/"
+            else:
+                target_url = f"{BASE_URL}/peliculas/{found_slug}/"
+        # Construimos la URL según el patrón real del sitio:
+        # - Películas: /peliculas/{slug}-{año}/
+        # - Episodios de serie: /episodio/{slug}-temporada-{n}-episodio-{n}/
+        elif type == "series" and season and episode:
+            target_url = f"{BASE_URL}/episodio/{slug_title}-temporada-{season}-episodio-{episode}/"
+        else:
+            target_url = f"{BASE_URL}/peliculas/{slug_title}-{year}/" if year else f"{BASE_URL}/peliculas/{slug_title}/"
 
     print(f"Extrayendo de: {target_url}")
 
@@ -522,8 +593,24 @@ async def get_stream(type: str, id: str):
                 es_url = f"{BASE_URL}/peliculas/{es_slug}-{year}/" if year else f"{BASE_URL}/peliculas/{es_slug}/"
             print(f"Reintentando con título en español: {es_url}")
             m3u8_url, req_headers = await extract_m3u8_playwright(es_url)
-            # Guardamos el título en español para usarlo también en la
-            # búsqueda de respaldo si esto tampoco funcionó.
+
+            # Si tampoco existe con ese slug exacto, probamos la API interna
+            # con el título en español (su búsqueda hace match parcial/fuzzy,
+            # así que puede encontrar variantes como "Las Crónicas de Narnia
+            # 3: ..." que no adivinaríamos armando el slug a mano).
+            if not m3u8_url:
+                api_posts_es = search_lamovie_api(es_title)
+                api_match_es = pick_best_api_match(api_posts_es, es_title, year, want_series=(type == "series")) \
+                    or next((p for p in api_posts_es if _norm_compare(es_title) in _norm_compare(p.get("title", ""))), None)
+                if api_match_es:
+                    found_slug = api_match_es.get("slug", "")
+                    print(f"Match encontrado por API interna (español): {found_slug}")
+                    if type == "series" and season and episode:
+                        es_api_url = f"{BASE_URL}/episodio/{found_slug}-temporada-{season}-episodio-{episode}/"
+                    else:
+                        es_api_url = f"{BASE_URL}/peliculas/{found_slug}/"
+                    m3u8_url, req_headers = await extract_m3u8_playwright(es_api_url)
+
             if not m3u8_url:
                 title = es_title
 
