@@ -26,10 +26,12 @@ BASE_URL = "https://lamovie.org"
 # puntuales no hay forma de adivinar automáticamente, así que se cargan acá
 # a mano una vez que se descubren. Formato: "ttXXXXXXX": "slug-del-sitio-año"
 MANUAL_SLUG_OVERRIDES = {
-    "tt12042730": "proyecto-fin-del-mundo-2026",              # Project Hail Mary
-    "tt33612209": "el-diablo-viste-a-la-moda-2-2026",         # The Devil Wears Prada 2
-    "tt18259538": "avatar-aang-el-ultimo-maestro-aire-2026",  # Avatar: Aang, El Último Maestro del Aire
-    "tt2488496": "star-wars-el-despertar-de-la-fuerza-2015",  # Star Wars: Episodio VII
+    "tt12042730": "proyecto-fin-del-mundo-2026",                          # Project Hail Mary
+    "tt33612209": "el-diablo-viste-a-la-moda-2-2026",                     # The Devil Wears Prada 2
+    "tt18259538": "avatar-aang-el-ultimo-maestro-aire-2026",              # Avatar: Aang, El Último Maestro del Aire
+    "tt2488496": "star-wars-el-despertar-de-la-fuerza-2015",              # Star Wars: Episodio VII
+    "tt2250912": "spider-man-de-regreso-a-casa-2017",                     # Spider-Man: Homecoming
+    "tt0363771": "las-cronicas-de-narnia-el-leon-la-bruja-y-el-ropero-2005",  # Narnia: El León, la Bruja y el Ropero
 }
 
 
@@ -272,17 +274,39 @@ async def search_lamovie_playwright(title: str, expect_path: str):
             page_title = await page.title()
             print(f"Página de búsqueda cargada. URL final: {final_url} | título: {page_title}")
 
-            # Juntamos todos los <a href> de la página ya renderizada (JS incluido)
-            # y nos quedamos con el primero que apunte al tipo esperado.
+            # Juntamos todos los <a href> de la página ya renderizada (JS incluido).
+            # IMPORTANTE: no aceptamos ciegamente el primer link "/peliculas/"
+            # que aparezca -- esos resultados suelen mezclarse con secciones de
+            # "populares/recomendados" que no tienen nada que ver con la
+            # búsqueda (esto causó un bug real: buscar "La asistenta" devolvía
+            # "Vinski - El superhéroe invisible" como si fuera un match válido).
+            # En cambio, exigimos que el slug del link comparta al menos una
+            # palabra significativa con el título buscado.
             hrefs = await page.eval_on_selector_all("a[href]", "els => els.map(e => e.href)")
             print(f"Total de links <a> encontrados en la página de búsqueda: {len(hrefs)}")
             candidatos = [h for h in hrefs if f"/{expect_path}/" in h]
             print(f"De esos, {len(candidatos)} contienen '/{expect_path}/': {candidatos[:5]}")
 
-            for href in hrefs:
-                if f"/{expect_path}/" in href and href.rstrip("/") != f"{BASE_URL}/{expect_path}".rstrip("/"):
-                    print(f"Resultado de búsqueda encontrado: {href}")
+            stopwords = {"el", "la", "los", "las", "de", "del", "y", "a", "en", "un", "una", "the", "of", "and", "a"}
+            title_words = {w for w in re.sub(r'[^a-z0-9\s]', '', title.lower()).split() if w and w not in stopwords and len(w) > 2}
+
+            seen = set()
+            for href in candidatos:
+                if href in seen:
+                    continue
+                seen.add(href)
+                if href.rstrip("/") == f"{BASE_URL}/{expect_path}".rstrip("/"):
+                    continue
+                slug_part = href.rstrip("/").split("/")[-1]
+                slug_words = set(re.sub(r'[^a-z0-9\s]', ' ', slug_part.replace("-", " ")).split())
+                overlap = title_words & slug_words
+                if overlap:
+                    print(f"Resultado de búsqueda encontrado (coincide en {overlap}): {href}")
                     return href
+                else:
+                    print(f"Descartado por no compartir palabras con el título buscado: {href}")
+
+            print("Ningún candidato de la búsqueda comparte palabras con el título -- no se acepta ninguno.")
             return None
         except Exception as e:
             print(f"Error buscando en LaMovie: {e}")
