@@ -77,6 +77,48 @@ def get_metadata_from_cinemeta(media_type: str, imdb_id: str):
 # artículo exacto por el ID DE IMDb (que ya tenemos), sin ambigüedad de
 # títulos ni desambiguaciones. Una vez encontrado el ítem, pedimos su
 # etiqueta ("label") en español.
+# 2c. TRADUCCIÓN DEL TÍTULO vía TMDB (es-MX): esta es la fuente de datos que
+# el propio LaMovie usa internamente (se nota por las rutas de imágenes tipo
+# "/oc3be3waruLd0PB9h4bomN7Le3v.jpg", formato típico de TMDB), así que el
+# título en es-MX (español latino) que da TMDB es el que MÁS probablemente
+# coincida con el slug real del sitio -- más confiable que Wikidata, que a
+# veces tiene el campo "es" vacío o sin traducir (ej: Captain America: Brave
+# New World, que en TMDB es-MX sí está como "Capitán América: un Nuevo
+# Mundo", pero en Wikidata queda igual al inglés).
+#
+# Requiere una API key gratuita de TMDB (variable de entorno TMDB_API_KEY).
+# Si no está configurada, esta función se salta sola y se sigue con Wikidata.
+TMDB_API_KEY = os.environ.get("TMDB_API_KEY", "")
+
+
+def get_spanish_title_via_tmdb(imdb_id: str, media_type: str = "movie"):
+    if not TMDB_API_KEY:
+        return None
+    try:
+        resp = requests.get(
+            f"https://api.themoviedb.org/3/find/{imdb_id}",
+            params={"api_key": TMDB_API_KEY, "external_source": "imdb_id", "language": "es-MX"},
+            timeout=6,
+        )
+        if resp.status_code != 200:
+            print(f"TMDB: find falló para {imdb_id}, status={resp.status_code}")
+            return None
+        data = resp.json()
+        results_key = "tv_results" if media_type == "series" else "movie_results"
+        results = data.get(results_key, [])
+        if not results:
+            print(f"TMDB: no hay resultados de tipo {results_key} para {imdb_id}")
+            return None
+        es_title = results[0].get("title") or results[0].get("name")
+        if es_title:
+            print(f"TMDB: {imdb_id} -> '{es_title}' (es-MX)")
+            return es_title
+        return None
+    except Exception as e:
+        print(f"Error consultando TMDB: {e}")
+        return None
+
+
 def get_spanish_title_via_wikidata(imdb_id: str):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     print(f"Consultando Wikidata para traducir vía IMDb ID: {imdb_id}")
@@ -248,10 +290,32 @@ def _norm_compare(s: str) -> str:
 
 # Elige, entre los resultados de la API, el que mejor matchee contra el
 # título en inglés (comparando "original_title") y, si lo tenemos, el año.
+_STOPWORDS = {"el", "la", "los", "las", "de", "del", "y", "e", "a", "en", "un", "una", "unos", "unas",
+              "the", "of", "and", "an", "to"}
+
+
+def _significant_words(s: str):
+    words = re.sub(r'[^a-z0-9\s]', ' ', (s or '').lower()).split()
+    return [w for w in words if w and w not in _STOPWORDS and len(w) > 1]
+
+
+# Puntaje por superposición de palabras significativas -- a diferencia de un
+# match exacto o de substring, esto tolera diferencias como un número de
+# saga insertado ("Las Crónicas de Narnia 3: ...") o pequeñas variaciones de
+# puntuación, mientras la mayoría de las palabras clave sigan coincidiendo.
+def _word_overlap_score(query_words, candidate_text):
+    if not query_words:
+        return 0.0
+    cand_words = set(_significant_words(candidate_text))
+    matched = sum(1 for w in query_words if w in cand_words)
+    return matched / len(query_words)
+
+
 def pick_best_api_match(posts, title: str, year: str, want_series: bool):
     if not posts:
         return None
     target = _norm_compare(title)
+    query_words = _significant_words(title)
 
     def type_matches(p):
         t = (p.get("type") or "").lower()
@@ -270,6 +334,26 @@ def pick_best_api_match(posts, title: str, year: str, want_series: bool):
     for p in same_type:
         if _norm_compare(p.get("original_title", "")) == target:
             return p
+
+    # 3) Superposición de palabras (contra original_title Y contra title, el
+    # que dé mejor puntaje), exigiendo que coincida la gran mayoría de las
+    # palabras clave para no aceptar algo poco relacionado. Si además
+    # tenemos el año y coincide, es un empate a favor casi seguro.
+    best, best_score = None, 0.0
+    for p in same_type:
+        score = max(
+            _word_overlap_score(query_words, p.get("original_title", "")),
+            _word_overlap_score(query_words, p.get("title", "")),
+        )
+        if year and str(year) in str(p.get("release_date", "")):
+            score += 0.15  # empujoncito si el año también coincide
+        if score > best_score:
+            best, best_score = p, score
+
+    if best and best_score >= 0.8:
+        print(f"Match por superposición de palabras (score={best_score:.2f}): {best.get('slug')}")
+        return best
+
     return None
 
 
@@ -584,7 +668,7 @@ async def get_stream(type: str, id: str):
     # es 100% en español), probamos con el título real en español antes de
     # gastar tiempo en la búsqueda con navegador.
     if not m3u8_url:
-        es_title = get_spanish_title_via_wikidata(imdb_id) or get_spanish_title_via_wikipedia(title, year)
+        es_title = get_spanish_title_via_tmdb(imdb_id, type) or get_spanish_title_via_wikidata(imdb_id) or get_spanish_title_via_wikipedia(title, year)
         if es_title:
             es_slug = slugify(es_title)
             if type == "series" and season and episode:
