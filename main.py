@@ -311,6 +311,72 @@ def _word_overlap_score(query_words, candidate_text):
     return matched / len(query_words)
 
 
+# 2c-bis. SLUG EXACTO DE EPISODIO vía la API real de episodios del sitio
+# (descubierta igual que la de búsqueda): dado el "_id" interno (post ID de
+# WordPress) de la serie, este endpoint devuelve el listado real de
+# episodios de una temporada, cada uno con su slug EXACTO -- así no
+# adivinamos el patrón "-temporada-N-episodio-M", lo leemos directo.
+def get_episode_slug_via_api(series_post_id, season: str, episode: str):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    page = 1
+    while True:
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/wp-api/v1/single/episodes/list",
+                params={"_id": series_post_id, "season": season, "page": page, "postsPerPage": 100},
+                timeout=8,
+                headers=headers,
+            )
+            if resp.status_code != 200:
+                print(f"API de episodios: status={resp.status_code} para _id={series_post_id} season={season}")
+                return None
+            payload = resp.json().get("data", {})
+            posts = payload.get("posts", [])
+            for p in posts:
+                if str(p.get("season_number")) == str(season) and str(p.get("episode_number")) == str(episode):
+                    print(f"Slug exacto de episodio encontrado vía API: {p.get('slug')}")
+                    return p.get("slug")
+            pagination = payload.get("pagination", {})
+            last_page = pagination.get("last_page", 1)
+            if page >= last_page:
+                print(f"API de episodios: temporada {season} no tiene el episodio {episode} (o no existe aún)")
+                return None
+            page += 1
+        except Exception as e:
+            print(f"Error consultando API de episodios: {e}")
+            return None
+
+
+# 2b-bis. LISTA DE EPISODIOS VÍA LA API INTERNA: en vez de adivinar el patrón
+# "temporada-X-episodio-Y" a mano, pedimos la lista real de episodios de la
+# temporada (usando el "_id" interno de la serie que ya nos dio la búsqueda) y
+# sacamos el slug EXACTO del episodio que buscamos. Mucho más confiable,
+# porque no depende de que el patrón de nombres se mantenga siempre igual.
+def get_episode_slug_via_api(series_id, season: str, episode: str):
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/wp-api/v1/single/episodes/list",
+            params={"_id": series_id, "season": season, "page": 1, "postsPerPage": 50},
+            timeout=8,
+            headers=headers,
+        )
+        if resp.status_code != 200:
+            print(f"API de episodios: status={resp.status_code} para _id={series_id} season={season}")
+            return None
+        posts = resp.json().get("data", {}).get("posts", [])
+        print(f"API de episodios para _id={series_id} temporada {season}: {len(posts)} episodio(s)")
+        for ep in posts:
+            if str(ep.get("episode_number")) == str(episode):
+                print(f"Episodio encontrado por API: {ep.get('slug')}")
+                return ep.get("slug")
+        print(f"No se encontró el episodio {episode} en la lista de la temporada {season}")
+        return None
+    except Exception as e:
+        print(f"Error consultando la API de episodios: {e}")
+        return None
+
+
 def pick_best_api_match(posts, title: str, year: str, want_series: bool):
     if not posts:
         return None
@@ -649,11 +715,18 @@ async def get_stream(type: str, id: str):
             found_slug = api_match.get("slug", "")
             print(f"Match encontrado por API interna: {found_slug}")
             if type == "series" and season and episode:
-                # El slug de la serie puede traer el año pegado (ej:
-                # "house-of-the-dragon-2022"), pero la URL de episodio NO lo
-                # lleva -- hay que sacarlo antes de agregar temporada/episodio.
-                series_slug = re.sub(r'-\d{4}$', '', found_slug)
-                target_url = f"{BASE_URL}/episodio/{series_slug}-temporada-{season}-episodio-{episode}/"
+                # Mejor opción: pedirle a la API real de episodios el slug
+                # EXACTO (no adivinamos el patrón "-temporada-N-episodio-M").
+                series_post_id = api_match.get("_id")
+                exact_slug = get_episode_slug_via_api(series_post_id, season, episode) if series_post_id else None
+                if exact_slug:
+                    target_url = f"{BASE_URL}/episodio/{exact_slug}/"
+                else:
+                    # Respaldo: armamos el patrón a mano (el slug de la serie
+                    # puede traer el año pegado, ej "house-of-the-dragon-2022",
+                    # que hay que sacar antes de agregar temporada/episodio).
+                    series_slug = re.sub(r'-\d{4}$', '', found_slug)
+                    target_url = f"{BASE_URL}/episodio/{series_slug}-temporada-{season}-episodio-{episode}/"
             else:
                 target_url = f"{BASE_URL}/peliculas/{found_slug}/"
         # Construimos la URL según el patrón real del sitio:
@@ -694,8 +767,13 @@ async def get_stream(type: str, id: str):
                     found_slug = api_match_es.get("slug", "")
                     print(f"Match encontrado por API interna (español): {found_slug}")
                     if type == "series" and season and episode:
-                        series_slug_es = re.sub(r'-\d{4}$', '', found_slug)
-                        es_api_url = f"{BASE_URL}/episodio/{series_slug_es}-temporada-{season}-episodio-{episode}/"
+                        series_post_id_es = api_match_es.get("_id")
+                        exact_slug_es = get_episode_slug_via_api(series_post_id_es, season, episode) if series_post_id_es else None
+                        if exact_slug_es:
+                            es_api_url = f"{BASE_URL}/episodio/{exact_slug_es}/"
+                        else:
+                            series_slug_es = re.sub(r'-\d{4}$', '', found_slug)
+                            es_api_url = f"{BASE_URL}/episodio/{series_slug_es}-temporada-{season}-episodio-{episode}/"
                     else:
                         es_api_url = f"{BASE_URL}/peliculas/{found_slug}/"
                     m3u8_url, req_headers = await extract_m3u8_playwright(es_api_url)
