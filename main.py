@@ -895,7 +895,7 @@ async def get_stream(type: str, id: str):
         api_posts = search_lamovie_api(title)
         api_match = pick_best_api_match(api_posts, title, year, want_series=is_series)
         if api_match:
-            found_slug = re.sub(r'-\d{4}$', '', api_match.get("slug", ""))
+            found_slug = api_match.get("slug", "")
             print(f"Match encontrado por API interna: {found_slug}")
             m3u8_url, req_headers = await try_url(found_slug)
 
@@ -920,7 +920,7 @@ async def get_stream(type: str, id: str):
                 api_match_es = pick_best_api_match(api_posts_es, es_title, year, want_series=is_series) \
                     or next((p for p in api_posts_es if _norm_compare(es_title) in _norm_compare(p.get("title", ""))), None)
                 if api_match_es:
-                    found_slug_es = re.sub(r'-\d{4}$', '', api_match_es.get("slug", ""))
+                    found_slug_es = api_match_es.get("slug", "")
                     print(f"Match encontrado por API interna (español): {found_slug_es}")
                     m3u8_url, req_headers = await try_url(found_slug_es)
 
