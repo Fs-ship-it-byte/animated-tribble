@@ -664,6 +664,175 @@ async def extract_m3u8_playwright(url: str):
         return result["url"], result["headers"]
 
 
+# 3b. EXTRACTOR ESPECÍFICO PARA SERIES: a diferencia de las películas, la URL
+# de una serie SIEMPRE es /series/{slug}/ (nunca cambia por episodio). Elegir
+# temporada/episodio pasa 100% por interacciones de JS en la misma página:
+# botón "Episodios" -> selector de "Temporada N" -> clic en el episodio
+# exacto (identificado por su etiqueta "S×E", ej "1×2"). Recién ese clic
+# dispara la carga del reproductor de ESE episodio.
+async def extract_series_episode_m3u8(series_url: str, season: str, episode: str):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+        )
+        context = await browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        )
+        page = await context.new_page()
+        result = {"url": None, "headers": None}
+
+        async def intercept_route(route):
+            request_url = route.request.url.lower()
+            ad_keywords = ["/ads/", "vast", "vpaid", "pop", "tracker", "analytics", "doubleclick", "adservice"]
+            if any(ad in request_url for ad in ad_keywords):
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", intercept_route)
+
+        async def close_popups(new_page):
+            try:
+                await new_page.close()
+            except Exception:
+                pass
+
+        context.on("page", close_popups)
+
+        async def handle_request(request):
+            if result["url"]:
+                return
+            url_lower = request.url.lower()
+            if ".m3u8" in url_lower or ".mp4" in url_lower or "master.json" in url_lower:
+                print(f"👉 ¡VIDEO DETECTADO!: {request.url}")
+                headers = request.headers
+                result["url"] = request.url
+                result["headers"] = {
+                    "Referer": headers.get("referer", series_url),
+                    "Origin": headers.get("origin", "/".join(series_url.split("/")[:3])),
+                    "User-Agent": headers.get(
+                        "user-agent",
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                    ),
+                }
+
+        page.on("request", handle_request)
+
+        click_selectors = [
+            "#player .--pl",
+            ".jw-icon-playback",
+            ".vjs-big-play-button",
+            ".plyr__control--overlaid",
+            "#player",
+            "video",
+        ]
+
+        try:
+            print(f"Navegando a la serie: {series_url}")
+            await page.goto(series_url, wait_until="domcontentloaded", timeout=15000)
+
+            titulo = await page.title()
+            print(f"Título de la página: {titulo}")
+            if "no encontrada" in titulo.lower() or "404" in titulo:
+                print("Página de la serie no encontrada, saltando.")
+                return None, None
+
+            # 1) Abrir la lista de episodios
+            try:
+                await page.get_by_text("Episodios", exact=True).first.click(timeout=5000)
+                print("Clic en 'Episodios' ejecutado.")
+            except Exception as e:
+                print(f"No se pudo hacer clic en 'Episodios': {e}")
+            await asyncio.sleep(1)
+
+            # 2) Si la temporada por defecto no es la que buscamos, cambiarla
+            try:
+                season_button = page.locator(".ss-button[aria-haspopup='listbox']").first
+                if await season_button.count() > 0:
+                    current_text = await season_button.inner_text()
+                    if f"Temporada {season}" not in current_text:
+                        await season_button.click(timeout=5000)
+                        print("Selector de temporadas abierto.")
+                        await asyncio.sleep(0.5)
+                        option = page.get_by_text(f"Temporada {season}", exact=True).first
+                        await option.click(timeout=5000)
+                        print(f"Temporada {season} seleccionada.")
+                        await asyncio.sleep(1.5)  # esperar que la lista de episodios recargue (AJAX)
+                    else:
+                        print(f"Ya estaba en la temporada {season}, no hace falta cambiar.")
+            except Exception as e:
+                print(f"No se pudo cambiar de temporada: {e}")
+
+            # 3) Buscar y clickear el episodio exacto por su etiqueta "S×E"
+            episode_label = f"{season}×{episode}"
+            try:
+                ep_item = page.locator(".episode-item", has_text=episode_label).first
+                if await ep_item.count() > 0:
+                    await ep_item.click(timeout=5000)
+                    print(f"Clic en el episodio '{episode_label}' ejecutado.")
+                else:
+                    print(f"No se encontró ningún episodio con etiqueta '{episode_label}' en la lista.")
+            except Exception as e:
+                print(f"Error al clickear el episodio: {e}")
+
+            await asyncio.sleep(1.5)
+
+            # 4) Igual que con películas: puede hacer falta un clic de play
+            #    adicional sobre el reproductor, y saltar anuncios.
+            clicked = False
+            for sel in click_selectors:
+                if result["url"]:
+                    break
+                try:
+                    el = page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.click(timeout=3000)
+                        clicked = True
+                        print(f"Clic ejecutado sobre selector: {sel}")
+                        break
+                except Exception:
+                    continue
+
+            if not clicked and not result["url"]:
+                try:
+                    box = await page.viewport_size()
+                    if box:
+                        await page.mouse.click(box["width"] // 2, box["height"] // 2)
+                        print("Clic de respaldo en el centro de la página ejecutado.")
+                except Exception:
+                    pass
+
+            for _ in range(15):
+                if result["url"]:
+                    break
+                try:
+                    skip_btn = page.get_by_text(re.compile(r"saltar|skip|close|cerrar", re.IGNORECASE)).first
+                    if await skip_btn.is_visible():
+                        await skip_btn.click()
+                        print("Botón Saltar presionado. Dando un segundo para procesar...")
+                        await asyncio.sleep(1)
+                        for sel in click_selectors:
+                            try:
+                                el = page.locator(sel).first
+                                if await el.count() > 0:
+                                    await el.click(timeout=2000)
+                                    print(f"Segundo clic ejecutado sobre selector: {sel}")
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    pass
+                await asyncio.sleep(1)
+
+        except Exception as e:
+            print(f"Error en Playwright (serie): {e}")
+        finally:
+            await browser.close()
+
+        return result["url"], result["headers"]
+
+
 # 4. ENDPOINT DEL MANIFEST (CONFIGURADO PARA PELÍCULAS Y SERIES)
 @app.get("/manifest.json")
 def get_manifest():
@@ -694,108 +863,78 @@ async def get_stream(type: str, id: str):
     if not title:
         return {"streams": []}
 
+    is_series = type == "series" and season and episode
     slug_title = slugify(title)
 
-    # Si este IMDb ID tiene una anulación manual cargada (título traducido de
-    # forma distinta por el propio sitio), la usamos directo sin adivinar.
+    def build_url(slug: str) -> str:
+        # Las series SIEMPRE viven en /series/{slug}/ -- nunca hay una URL
+        # distinta por episodio, la temporada/episodio se elige haciendo clic
+        # dentro de la misma página (ver extract_series_episode_m3u8).
+        if is_series:
+            return f"{BASE_URL}/series/{slug}/"
+        return f"{BASE_URL}/peliculas/{slug}/"
+
+    async def try_url(slug: str):
+        target_url = build_url(slug)
+        print(f"Extrayendo de: {target_url}")
+        if is_series:
+            return await extract_series_episode_m3u8(target_url, season, episode)
+        return await extract_m3u8_playwright(target_url)
+
+    m3u8_url, req_headers = None, None
+
+    # 1) Anulación manual (título traducido distinto por el propio sitio)
     if imdb_id in MANUAL_SLUG_OVERRIDES:
         override_slug = MANUAL_SLUG_OVERRIDES[imdb_id]
-        if type == "series" and season and episode:
-            target_url = f"{BASE_URL}/episodio/{override_slug}-temporada-{season}-episodio-{episode}/"
-        else:
-            target_url = f"{BASE_URL}/peliculas/{override_slug}/"
-        print(f"Usando anulación manual para {imdb_id}: {target_url}")
-    else:
-        # Antes de adivinar nada, probamos la API interna real del sitio,
-        # comparando por "original_title" (inglés) -- resuelve el problema de
-        # idioma de raíz sin depender de traducir nosotros.
+        print(f"Usando anulación manual para {imdb_id}: {build_url(override_slug)}")
+        m3u8_url, req_headers = await try_url(override_slug)
+
+    # 2) API interna con el título en inglés (resuelve el problema de idioma
+    # de raíz sin depender de traducir nosotros, comparando "original_title").
+    if not m3u8_url:
         api_posts = search_lamovie_api(title)
-        api_match = pick_best_api_match(api_posts, title, year, want_series=(type == "series"))
+        api_match = pick_best_api_match(api_posts, title, year, want_series=is_series)
         if api_match:
-            found_slug = api_match.get("slug", "")
+            found_slug = re.sub(r'-\d{4}$', '', api_match.get("slug", ""))
             print(f"Match encontrado por API interna: {found_slug}")
-            if type == "series" and season and episode:
-                # Mejor opción: pedirle a la API real de episodios el slug
-                # EXACTO (no adivinamos el patrón "-temporada-N-episodio-M").
-                series_post_id = api_match.get("_id")
-                exact_slug = get_episode_slug_via_api(series_post_id, season, episode) if series_post_id else None
-                if exact_slug:
-                    target_url = f"{BASE_URL}/episodio/{exact_slug}/"
-                else:
-                    # Respaldo: armamos el patrón a mano (el slug de la serie
-                    # puede traer el año pegado, ej "house-of-the-dragon-2022",
-                    # que hay que sacar antes de agregar temporada/episodio).
-                    series_slug = re.sub(r'-\d{4}$', '', found_slug)
-                    target_url = f"{BASE_URL}/episodio/{series_slug}-temporada-{season}-episodio-{episode}/"
-            else:
-                target_url = f"{BASE_URL}/peliculas/{found_slug}/"
-        # Construimos la URL según el patrón real del sitio:
-        # - Películas: /peliculas/{slug}-{año}/
-        # - Episodios de serie: /episodio/{slug}-temporada-{n}-episodio-{n}/
-        elif type == "series" and season and episode:
-            target_url = f"{BASE_URL}/episodio/{slug_title}-temporada-{season}-episodio-{episode}/"
-        else:
-            target_url = f"{BASE_URL}/peliculas/{slug_title}-{year}/" if year else f"{BASE_URL}/peliculas/{slug_title}/"
+            m3u8_url, req_headers = await try_url(found_slug)
 
-    print(f"Extrayendo de: {target_url}")
+    # 3) Slug adivinado directo (título+año tal cual, sin traducir)
+    if not m3u8_url:
+        guess_slug = slug_title if is_series else (f"{slug_title}-{year}" if year else slug_title)
+        m3u8_url, req_headers = await try_url(guess_slug)
 
-    m3u8_url, req_headers = await extract_m3u8_playwright(target_url)
-
-    # Si el slug en inglés no existe en el sitio (muy probable, ya que LaMovie
-    # es 100% en español), probamos con el título real en español antes de
-    # gastar tiempo en la búsqueda con navegador.
+    # 4) Traducción del título (TMDB es-MX -> Wikidata -> Wikipedia) + reintento
     if not m3u8_url:
         es_title = get_spanish_title_via_tmdb(imdb_id, type) or get_spanish_title_via_wikidata(imdb_id) or get_spanish_title_via_wikipedia(title, year)
         if es_title:
-            es_slug = slugify(es_title)
-            if type == "series" and season and episode:
-                es_url = f"{BASE_URL}/episodio/{es_slug}-temporada-{season}-episodio-{episode}/"
-            else:
-                es_url = f"{BASE_URL}/peliculas/{es_slug}-{year}/" if year else f"{BASE_URL}/peliculas/{es_slug}/"
-            print(f"Reintentando con título en español: {es_url}")
-            m3u8_url, req_headers = await extract_m3u8_playwright(es_url)
+            es_slug_guess = slugify(es_title) if is_series else (f"{slugify(es_title)}-{year}" if year else slugify(es_title))
+            print(f"Reintentando con título en español: {build_url(es_slug_guess)}")
+            m3u8_url, req_headers = await try_url(es_slug_guess)
 
             # Si tampoco existe con ese slug exacto, probamos la API interna
-            # con el título en español (su búsqueda hace match parcial/fuzzy,
-            # así que puede encontrar variantes como "Las Crónicas de Narnia
-            # 3: ..." que no adivinaríamos armando el slug a mano).
+            # con el título en español (hace match parcial/fuzzy, encuentra
+            # variantes como "Las Crónicas de Narnia 3: ...").
             if not m3u8_url:
                 api_posts_es = search_lamovie_api(es_title)
-                api_match_es = pick_best_api_match(api_posts_es, es_title, year, want_series=(type == "series")) \
+                api_match_es = pick_best_api_match(api_posts_es, es_title, year, want_series=is_series) \
                     or next((p for p in api_posts_es if _norm_compare(es_title) in _norm_compare(p.get("title", ""))), None)
                 if api_match_es:
-                    found_slug = api_match_es.get("slug", "")
-                    print(f"Match encontrado por API interna (español): {found_slug}")
-                    if type == "series" and season and episode:
-                        series_post_id_es = api_match_es.get("_id")
-                        exact_slug_es = get_episode_slug_via_api(series_post_id_es, season, episode) if series_post_id_es else None
-                        if exact_slug_es:
-                            es_api_url = f"{BASE_URL}/episodio/{exact_slug_es}/"
-                        else:
-                            series_slug_es = re.sub(r'-\d{4}$', '', found_slug)
-                            es_api_url = f"{BASE_URL}/episodio/{series_slug_es}-temporada-{season}-episodio-{episode}/"
-                    else:
-                        es_api_url = f"{BASE_URL}/peliculas/{found_slug}/"
-                    m3u8_url, req_headers = await extract_m3u8_playwright(es_api_url)
+                    found_slug_es = re.sub(r'-\d{4}$', '', api_match_es.get("slug", ""))
+                    print(f"Match encontrado por API interna (español): {found_slug_es}")
+                    m3u8_url, req_headers = await try_url(found_slug_es)
 
             if not m3u8_url:
                 title = es_title
 
-    # Si nada de lo anterior encontró nada, probamos primero la API REST
-    # (rápida) y si no, el buscador visual con navegador (último respaldo).
+    # 5) Último respaldo: buscador visual con navegador
     if not m3u8_url:
-        if type == "series" and season and episode:
-            series_url = search_lamovie_restapi(title, "series") or await search_lamovie_playwright(title, "series")
-            if series_url:
-                real_slug = series_url.rstrip("/").split("/")[-1]
-                found_url = f"{BASE_URL}/episodio/{real_slug}-temporada-{season}-episodio-{episode}/"
-                print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
-                m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
-        else:
-            found_url = search_lamovie_restapi(title, "peliculas") or await search_lamovie_playwright(title, "peliculas")
-            if found_url:
-                print(f"Reintentando con URL encontrada por búsqueda: {found_url}")
-                m3u8_url, req_headers = await extract_m3u8_playwright(found_url)
+        expect_path = "series" if is_series else "peliculas"
+        found_url = await search_lamovie_playwright(title, expect_path)
+        if found_url:
+            found_slug = found_url.rstrip("/").split("/")[-1]
+            print(f"Reintentando con slug encontrado por búsqueda: {found_slug}")
+            m3u8_url, req_headers = await try_url(found_slug)
 
     if m3u8_url:
         stream_title = "LaMovie 🎬"
