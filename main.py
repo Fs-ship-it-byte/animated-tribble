@@ -746,7 +746,14 @@ async def extract_series_episode_m3u8(series_url: str, season: str, episode: str
                 print(f"No se pudo hacer clic en 'Episodios': {e}")
             await asyncio.sleep(1)
 
-            # 2) Si la temporada por defecto no es la que buscamos, cambiarla
+            # 2) Si la temporada por defecto no es la que buscamos, cambiarla.
+            # IMPORTANTE: si esto falla (ej: la temporada pedida no existe
+            # todavía en el sitio, como "temporada 37" de una serie que solo
+            # llega a la 36), NO seguimos adelante -- si no, terminaríamos
+            # capturando el video que ya estaba cargado por defecto (T1E1) y
+            # devolviéndolo como si fuera el episodio correcto, sirviendo
+            # contenido equivocado con total confianza.
+            season_changed_ok = True
             try:
                 season_button = page.locator(".ss-button[aria-haspopup='listbox']").first
                 if await season_button.count() > 0:
@@ -756,15 +763,26 @@ async def extract_series_episode_m3u8(series_url: str, season: str, episode: str
                         print("Selector de temporadas abierto.")
                         await asyncio.sleep(0.5)
                         option = page.get_by_text(f"Temporada {season}", exact=True).first
-                        await option.click(timeout=5000)
-                        print(f"Temporada {season} seleccionada.")
-                        await asyncio.sleep(1.5)  # esperar que la lista de episodios recargue (AJAX)
+                        if await option.count() > 0:
+                            await option.click(timeout=5000)
+                            print(f"Temporada {season} seleccionada.")
+                            await asyncio.sleep(1.5)  # esperar que la lista de episodios recargue (AJAX)
+                        else:
+                            print(f"La temporada {season} no existe en el selector -- probablemente no está disponible todavía.")
+                            season_changed_ok = False
                     else:
                         print(f"Ya estaba en la temporada {season}, no hace falta cambiar.")
             except Exception as e:
                 print(f"No se pudo cambiar de temporada: {e}")
+                season_changed_ok = False
 
-            # 3) Buscar y clickear el episodio exacto por su etiqueta "S×E"
+            if not season_changed_ok:
+                print("Abortando: no se pudo confirmar la temporada pedida, no se va a servir un episodio equivocado.")
+                return None, None
+
+            # 3) Buscar y clickear el episodio exacto por su etiqueta "S×E".
+            # Mismo criterio: si no aparece en la lista, cortamos acá en vez
+            # de capturar cualquier video que ya esté cargado por defecto.
             episode_label = f"{season}×{episode}"
             try:
                 ep_item = page.locator(".episode-item", has_text=episode_label).first
@@ -772,9 +790,11 @@ async def extract_series_episode_m3u8(series_url: str, season: str, episode: str
                     await ep_item.click(timeout=5000)
                     print(f"Clic en el episodio '{episode_label}' ejecutado.")
                 else:
-                    print(f"No se encontró ningún episodio con etiqueta '{episode_label}' en la lista.")
+                    print(f"No se encontró ningún episodio con etiqueta '{episode_label}' en la lista -- probablemente no está disponible todavía.")
+                    return None, None
             except Exception as e:
                 print(f"Error al clickear el episodio: {e}")
+                return None, None
 
             await asyncio.sleep(1.5)
 
