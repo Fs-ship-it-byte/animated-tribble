@@ -10,6 +10,11 @@ from urllib.parse import quote_plus
 
 app = FastAPI()
 
+
+@app.on_event("shutdown")
+async def _shutdown():
+    await close_shared_browser()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +24,57 @@ app.add_middleware(
 )
 
 BASE_URL = "https://lamovie.org"
+
+# ---------- BROWSER COMPARTIDO ----------
+# Antes, CADA función (búsqueda visual, extracción de película, extracción de
+# episodio) abría su PROPIO Chromium con `p.chromium.launch(...)` y lo cerraba
+# al terminar. Un solo pedido de serie puede recorrer 2-3 de estas funciones
+# en secuencia (probar slug 1, probar slug 2, buscador visual), y con varios
+# pedidos concurrentes de Stremio, se llegó a intentar lanzar tantos procesos
+# Chromium a la vez que el sistema operativo se quedó sin recursos para hacer
+# fork() de uno más -- eso es EXACTAMENTE lo que tiraba
+# "BlockingIOError: [Errno 11] Resource temporarily unavailable".
+#
+# Ahora hay UN SOLO Chromium compartido para todo el proceso (se lanza una
+# vez y se reutiliza), y cada operación abre su propio `browser.new_context()`
+# (liviano, aislado -- cookies/estado propios) en vez de un browser entero.
+# Un semáforo limita cuántas operaciones de Playwright corren en simultáneo,
+# para no saturar CPU/memoria del contenedor aunque el browser en sí sea uno solo.
+_playwright_instance = None
+_shared_browser = None
+_browser_lock = asyncio.Lock()
+_playwright_semaphore = asyncio.Semaphore(2)
+
+
+async def get_shared_browser():
+    global _playwright_instance, _shared_browser
+    async with _browser_lock:
+        if _shared_browser is None or not _shared_browser.is_connected():
+            if _playwright_instance is None:
+                _playwright_instance = await async_playwright().start()
+            _shared_browser = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
+            )
+        return _shared_browser
+
+
+async def close_shared_browser():
+    global _playwright_instance, _shared_browser
+    if _shared_browser is not None:
+        try:
+            await _shared_browser.close()
+        except Exception:
+            pass
+        _shared_browser = None
+    if _playwright_instance is not None:
+        try:
+            await _playwright_instance.stop()
+        except Exception:
+            pass
+        _playwright_instance = None
+
+
 
 # Algunos títulos (sobre todo estrenos muy recientes) usan una traducción
 # "inventada" por el propio sitio que no coincide ni con el título en inglés
@@ -316,6 +372,9 @@ def _word_overlap_score(query_words, candidate_text):
 # WordPress) de la serie, este endpoint devuelve el listado real de
 # episodios de una temporada, cada uno con su slug EXACTO -- así no
 # adivinamos el patrón "-temporada-N-episodio-M", lo leemos directo.
+# NOTA: esta función no se usa actualmente en el flujo (extract_series_episode_m3u8
+# resuelve el episodio por clicks en el sitio, no por slug directo), pero se
+# deja disponible por si se quiere usar como camino alternativo más rápido.
 def get_episode_slug_via_api(series_post_id, season: str, episode: str):
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
     page = 1
@@ -345,36 +404,6 @@ def get_episode_slug_via_api(series_post_id, season: str, episode: str):
         except Exception as e:
             print(f"Error consultando API de episodios: {e}")
             return None
-
-
-# 2b-bis. LISTA DE EPISODIOS VÍA LA API INTERNA: en vez de adivinar el patrón
-# "temporada-X-episodio-Y" a mano, pedimos la lista real de episodios de la
-# temporada (usando el "_id" interno de la serie que ya nos dio la búsqueda) y
-# sacamos el slug EXACTO del episodio que buscamos. Mucho más confiable,
-# porque no depende de que el patrón de nombres se mantenga siempre igual.
-def get_episode_slug_via_api(series_id, season: str, episode: str):
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-    try:
-        resp = requests.get(
-            f"{BASE_URL}/wp-api/v1/single/episodes/list",
-            params={"_id": series_id, "season": season, "page": 1, "postsPerPage": 50},
-            timeout=8,
-            headers=headers,
-        )
-        if resp.status_code != 200:
-            print(f"API de episodios: status={resp.status_code} para _id={series_id} season={season}")
-            return None
-        posts = resp.json().get("data", {}).get("posts", [])
-        print(f"API de episodios para _id={series_id} temporada {season}: {len(posts)} episodio(s)")
-        for ep in posts:
-            if str(ep.get("episode_number")) == str(episode):
-                print(f"Episodio encontrado por API: {ep.get('slug')}")
-                return ep.get("slug")
-        print(f"No se encontró el episodio {episode} en la lista de la temporada {season}")
-        return None
-    except Exception as e:
-        print(f"Error consultando la API de episodios: {e}")
-        return None
 
 
 def pick_best_api_match(posts, title: str, year: str, want_series: bool):
@@ -464,11 +493,9 @@ def search_lamovie_restapi(title: str, expect_path: str):
 # puede estar armado con JS/AJAX (tema Dooplay), así que necesita Playwright
 # para ejecutarse de verdad en vez de un GET plano.
 async def search_lamovie_playwright(title: str, expect_path: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
+    async with _playwright_semaphore:
+        browser = await get_shared_browser()
+        context = None
         try:
             context = await browser.new_context(
                 user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -520,16 +547,14 @@ async def search_lamovie_playwright(title: str, expect_path: str):
             print(f"Error buscando en LaMovie: {e}")
             return None
         finally:
-            await browser.close()
+            if context:
+                await context.close()
 
 
 # 3. EXTRACTOR CON PLAYWRIGHT (VERSIÓN INTEGRAL: SEGUNDO CLIC Y BLOQUEO SUAVE)
 async def extract_m3u8_playwright(url: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
+    async with _playwright_semaphore:
+        browser = await get_shared_browser()
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
@@ -659,7 +684,7 @@ async def extract_m3u8_playwright(url: str):
         except Exception as e:
             print(f"Error en Playwright: {e}")
         finally:
-            await browser.close()
+            await context.close()
 
         return result["url"], result["headers"]
 
@@ -671,11 +696,8 @@ async def extract_m3u8_playwright(url: str):
 # exacto (identificado por su etiqueta "S×E", ej "1×2"). Recién ese clic
 # dispara la carga del reproductor de ESE episodio.
 async def extract_series_episode_m3u8(series_url: str, season: str, episode: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage"],
-        )
+    async with _playwright_semaphore:
+        browser = await get_shared_browser()
         context = await browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         )
@@ -848,7 +870,7 @@ async def extract_series_episode_m3u8(series_url: str, season: str, episode: str
         except Exception as e:
             print(f"Error en Playwright (serie): {e}")
         finally:
-            await browser.close()
+            await context.close()
 
         return result["url"], result["headers"]
 
@@ -869,8 +891,40 @@ def get_manifest():
 
 
 # 5. ENDPOINT DE STREAMING (CONSTRUCCIÓN DE URL)
-@app.get("/stream/{type}/{id}.json")
-async def get_stream(type: str, id: str):
+# CACHÉ + DEDUPLICACIÓN de pedidos en curso: cada extracción con Playwright
+# tarda 15-30s+ (goto, clicks, esperas de anuncios). Si Stremio reintenta el
+# MISMO episodio antes de que termine la primera respuesta (algo que hace
+# seguido cuando una petición tarda), sin esto se disparaba un Chromium
+# nuevo por cada reintento en paralelo -- se vio clarito en los logs: el
+# mismo episodio pedido 4 veces en menos de un minuto, cada vez repitiendo
+# TODO el flujo desde cero.
+#   - _stream_cache: resultado ya resuelto, con vencimiento corto (los m3u8
+#     traen un token firmado con expiración propia, así que cachear de más
+#     serviría de poco -- esto es solo para absorber el reintento inmediato).
+#   - _inflight: si ya hay una extracción para esa MISMA key corriendo,
+#     cualquier pedido nuevo espera ese mismo resultado en vez de arrancar
+#     un segundo Chromium en paralelo.
+_stream_cache = {}
+_inflight = {}
+_CACHE_TTL_SECONDS = 90
+
+
+def _cache_get(key):
+    entry = _stream_cache.get(key)
+    if not entry:
+        return None
+    url, headers, ts = entry
+    if (asyncio.get_event_loop().time() - ts) > _CACHE_TTL_SECONDS:
+        _stream_cache.pop(key, None)
+        return None
+    return url, headers
+
+
+def _cache_set(key, url, headers):
+    _stream_cache[key] = (url, headers, asyncio.get_event_loop().time())
+
+
+async def resolve_stream(type: str, id: str):
     imdb_id = id
     season = None
     episode = None
@@ -881,7 +935,7 @@ async def get_stream(type: str, id: str):
     title, year = get_metadata_from_cinemeta(type, imdb_id)
 
     if not title:
-        return {"streams": []}
+        return None, None
 
     is_series = type == "series" and season and episode
     slug_title = slugify(title)
@@ -956,28 +1010,61 @@ async def get_stream(type: str, id: str):
             print(f"Reintentando con slug encontrado por búsqueda: {found_slug}")
             m3u8_url, req_headers = await try_url(found_slug)
 
-    if m3u8_url:
-        stream_title = "LaMovie 🎬"
-        if season and episode:
-            stream_title += f" (T{season} - E{episode})"
+    return m3u8_url, req_headers
 
-        stream_obj = {
-            "name": "LaMovie",
-            "title": stream_title,
-            "url": m3u8_url,
+
+@app.get("/stream/{type}/{id}.json")
+async def get_stream(type: str, id: str):
+    key = f"{type}:{id}"
+
+    cached = _cache_get(key)
+    if cached:
+        m3u8_url, req_headers = cached
+        print(f"[caché] {key} -> resultado reciente, no se vuelve a extraer.")
+    else:
+        # Si ya hay una extracción de ESTA MISMA key en curso (típico caso:
+        # Stremio reintentó antes de que terminara la primera), esperamos
+        # ESA misma tarea en vez de lanzar un segundo Chromium en paralelo.
+        existing = _inflight.get(key)
+        if existing:
+            print(f"[en curso] {key} -> ya hay una extracción corriendo, esperando su resultado...")
+            m3u8_url, req_headers = await existing
+        else:
+            task = asyncio.ensure_future(resolve_stream(type, id))
+            _inflight[key] = task
+            try:
+                m3u8_url, req_headers = await task
+            finally:
+                _inflight.pop(key, None)
+            if m3u8_url:
+                _cache_set(key, m3u8_url, req_headers)
+
+    if not m3u8_url:
+        return {"streams": []}
+
+    season = episode = None
+    if ":" in id:
+        _, season, episode = id.split(":")
+
+    stream_title = "LaMovie 🎬"
+    if season and episode:
+        stream_title += f" (T{season} - E{episode})"
+
+    stream_obj = {
+        "name": "LaMovie",
+        "title": stream_title,
+        "url": m3u8_url,
+    }
+    # Si logramos capturar los headers reales con los que se pidió el video,
+    # se los pasamos a Stremio para que los reenvíe al reproducir (si no,
+    # muchos CDNs rechazan la petición por Referer/Origin).
+    if req_headers:
+        stream_obj["behaviorHints"] = {
+            "notWebReady": True,
+            "proxyHeaders": {"request": req_headers},
         }
-        # Si logramos capturar los headers reales con los que se pidió el
-        # video, se los pasamos a Stremio para que los reenvíe al reproducir
-        # (si no, muchos CDNs rechazan la petición por Referer/Origin).
-        if req_headers:
-            stream_obj["behaviorHints"] = {
-                "notWebReady": True,
-                "proxyHeaders": {"request": req_headers},
-            }
 
-        return {"streams": [stream_obj]}
-
-    return {"streams": []}
+    return {"streams": [stream_obj]}
 
 
 # 6. RUTA RAÍZ PARA EVITAR EL ERROR "NOT FOUND"
